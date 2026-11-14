@@ -91,7 +91,16 @@ export async function POST(request: Request) {
             return NextResponse.json({ error: "tts_failed", message: await readUpstreamError(response) }, { status: 502 });
         }
         const audio = await response.arrayBuffer();
-        if (audio.byteLength > MAX_AUDIO_BYTES) {
+
+// ElevenLabs 音频诊断：不记录 API Key、文本或 Voice ID
+console.log("[ElevenLabs TTS诊断]", {
+    modelId: model,
+    contentType: response.headers.get("content-type"),
+    audioBytes: audio.byteLength,
+    outputFormat: "mp3_44100_192",
+});
+
+if (audio.byteLength > MAX_AUDIO_BYTES) {
             return NextResponse.json({ error: "audio_too_large", message: "返回的音频文件过大" }, { status: 502 });
         }
         return new Response(audio, {
