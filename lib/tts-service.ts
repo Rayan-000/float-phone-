@@ -388,6 +388,7 @@ function playAudioBlobElement(blob: Blob): { promise: Promise<void>; abort: () =
  * Returns an abort function to stop playback early. Playback is sequential.
  */
 export function playAudioBlob(blob: Blob): { promise: Promise<void>; abort: () => void } {
+       return playAudioBlobElement(blob);
     const ctx = getAudioContext();
     if (!ctx) return playAudioBlobElement(blob);
 
