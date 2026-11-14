@@ -25,6 +25,7 @@ export function resolveVoiceConfig(characterId: string, appId?: ContentAppId): V
  * Supported providers:
  * - Minimax: REST API → hex-encoded mp3
  * - OpenAI: REST API → binary audio blob
+ * - ElevenLabs: same-origin API route → binary audio blob (avoids browser CORS)
  */
 export async function synthesizeSpeech(
     text: string,
@@ -41,6 +42,10 @@ export async function synthesizeSpeech(
 
     if (provider === "OpenAI") {
         return synthesizeOpenAI(text, voiceConfig);
+    }
+
+    if (provider === "ElevenLabs") {
+        return synthesizeElevenLabs(text, voiceConfig);
     }
 
     return null;
@@ -165,6 +170,34 @@ async function synthesizeOpenAI(text: string, config: VoiceApiConfig): Promise<B
 
     const blob = await response.blob();
     return new Blob([await blob.arrayBuffer()], { type: "audio/mpeg" });
+}
+
+// ── ElevenLabs TTS ───────────────────────────────────
+// Call the app's own Next.js route rather than ElevenLabs directly. This avoids
+// browser CORS restrictions and keeps the API key out of the upstream URL.
+async function synthesizeElevenLabs(text: string, config: VoiceApiConfig): Promise<Blob | null> {
+    if (!config.apiKey) throw new Error("ElevenLabs API Key 未配置");
+    if (!config.defaultVoice?.trim()) throw new Error("ElevenLabs Voice ID 未配置");
+
+    const response = await fetchWithTimeout("/api/voice/elevenlabs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            apiKey: config.apiKey,
+            baseUrl: config.baseUrl || "https://api.elevenlabs.io/v1",
+            voiceId: config.defaultVoice.trim(),
+            model: config.model || "eleven_multilingual_v2",
+            text,
+        }),
+    });
+
+    if (!response.ok) {
+        const errText = await response.text().catch(() => "");
+        throw new Error(`ElevenLabs TTS 请求失败 (${response.status}): ${errText.slice(0, 500)}`);
+    }
+
+    const blob = await response.blob();
+    return new Blob([await blob.arrayBuffer()], { type: blob.type || "audio/mpeg" });
 }
 
 // ── iOS audio playback that coexists with speech recognition ──────────
