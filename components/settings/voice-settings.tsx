@@ -10,7 +10,7 @@ import { ConfirmDialog } from "@/components/ui/modal";
 import { Toggle, Input } from "@/components/ui/form";
 import { Alert } from "@/components/ui/feedback";
 
-const SUPPORTED_VOICE_PROVIDERS = new Set(["Minimax", "OpenAI"]);
+const SUPPORTED_VOICE_PROVIDERS = new Set(["Minimax", "OpenAI", "ElevenLabs"]);
 const MINIMAX_BASE_URL_OPTIONS = [
     { id: "cn", label: "国内版", baseUrl: "https://api.minimaxi.com/v1" },
     { id: "global", label: "海外版", baseUrl: "https://api.minimax.io/v1" },
@@ -23,6 +23,7 @@ const MINIMAX_SPEED_STEP = 0.1;
 const DEFAULT_SPEECH_SPEED = 1.0;
 const VOICE_PROVIDER_OPTIONS = [
     { value: "OpenAI", label: "OpenAI TTS" },
+    { value: "ElevenLabs", label: "ElevenLabs TTS" },
     { value: "MinimaxCN", label: "Minimax 语音国内版" },
     { value: "MinimaxGlobal", label: "Minimax 语音海外版" },
 ];
@@ -176,7 +177,9 @@ function uniqueOptions(options: VoiceOption[]): VoiceOption[] {
 }
 
 function defaultVoiceOptions(provider: string): VoiceOption[] {
-    return provider === "OpenAI" ? DEFAULT_OPENAI_VOICES : DEFAULT_MINIMAX_VOICES;
+    if (provider === "OpenAI") return DEFAULT_OPENAI_VOICES;
+    if (provider === "ElevenLabs") return [];
+    return DEFAULT_MINIMAX_VOICES;
 }
 
 function voiceOptionsForConfig(config: VoiceApiConfig, fetchedVoices: Record<string, VoiceOption[]>): VoiceOption[] {
@@ -213,6 +216,7 @@ function makeCloneVoiceId(config: VoiceApiConfig): string {
 
 function providerSelectValue(config: VoiceApiConfig): string {
     if (config.provider === "OpenAI") return "OpenAI";
+    if (config.provider === "ElevenLabs") return "ElevenLabs";
     return config.baseUrl === GLOBAL_MINIMAX_BASE_URL ? "MinimaxGlobal" : "MinimaxCN";
 }
 
@@ -295,6 +299,17 @@ export function VoiceSettings() {
 
     const updateProvider = (id: string, providerOption: string) => {
         const current = configs.find(c => c.id === id);
+        if (providerOption === "ElevenLabs") {
+            updateConfig(id, {
+                provider: "ElevenLabs",
+                baseUrl: "https://api.elevenlabs.io/v1",
+                model: "eleven_multilingual_v2",
+                defaultVoice: current?.provider === "ElevenLabs" ? (current.defaultVoice || "") : "",
+            });
+            setManualModelIds(prev => ({ ...prev, [id]: true }));
+            setManualVoiceIds(prev => ({ ...prev, [id]: true }));
+            return;
+        }
         if (providerOption === "OpenAI") {
             updateConfig(id, {
                 provider: "OpenAI",
@@ -490,6 +505,21 @@ export function VoiceSettings() {
 
             } else if (config.provider === "OpenAI") {
                 setFetchedVoices(prev => ({ ...prev, [config.id]: DEFAULT_OPENAI_VOICES }));
+            } else if (config.provider === "ElevenLabs") {
+                if (!config.apiKey.trim()) throw new Error("请先填写 ElevenLabs API Key");
+                const response = await fetch("/api/voice/elevenlabs", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        action: "voices",
+                        apiKey: config.apiKey,
+                        baseUrl: config.baseUrl || "https://api.elevenlabs.io/v1",
+                    }),
+                });
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok) throw new Error(data.message || data.error || `同步失败 (${response.status})`);
+                const voices = Array.isArray(data.voices) ? data.voices as VoiceOption[] : [];
+                setFetchedVoices(prev => ({ ...prev, [config.id]: voices }));
             } else {
                 throw new Error("该服务商暂不支持拉取模型列表");
             }
@@ -668,7 +698,7 @@ export function VoiceSettings() {
                                                 placeholder="输入密钥..."
                                             />
                                         </div>
-                                        {config.provider === "OpenAI" && (
+                                        {(config.provider === "OpenAI" || config.provider === "ElevenLabs") && (
                                             <>
                                                 <div className="flex flex-col gap-1">
                                                     <label className="menu-desc ml-1">接口地址 (Base URL)</label>
@@ -676,29 +706,31 @@ export function VoiceSettings() {
                                                         type="text"
                                                         value={config.baseUrl || ""}
                                                         onChange={(e) => updateConfig(config.id, { baseUrl: e.target.value })}
-                                                        placeholder="https://api.openai.com/v1"
+                                                        placeholder={config.provider === "ElevenLabs" ? "https://api.elevenlabs.io/v1" : "https://api.openai.com/v1"}
                                                     />
                                                 </div>
                                                 <div className="flex flex-col gap-1">
                                                     <label className="menu-desc ml-1">语音模型 (TTS Model)</label>
-                                                    {manualModelIds[config.id] ? (
+                                                    {config.provider === "ElevenLabs" || manualModelIds[config.id] ? (
                                                         <div className="flex gap-2">
                                                             <Input
                                                                 type="text"
                                                                 value={config.model || ""}
                                                                 onChange={(e) => updateConfig(config.id, { model: e.target.value })}
-                                                                placeholder="手动输入模型 ID"
+                                                                placeholder={config.provider === "ElevenLabs" ? "例如 eleven_multilingual_v2" : "手动输入模型 ID"}
                                                                 className="flex-1"
                                                             />
-                                                            <button
-                                                                type="button"
-                                                                onClick={() => setManualModelIds(prev => ({ ...prev, [config.id]: false }))}
-                                                                className="ui-icon-btn"
-                                                                aria-label="返回模型下拉选择"
-                                                                title="返回模型下拉选择"
-                                                            >
-                                                                <List size={20} />
-                                                            </button>
+                                                            {config.provider !== "ElevenLabs" && (
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => setManualModelIds(prev => ({ ...prev, [config.id]: false }))}
+                                                                    className="ui-icon-btn"
+                                                                    aria-label="返回模型下拉选择"
+                                                                    title="返回模型下拉选择"
+                                                                >
+                                                                    <List size={20} />
+                                                                </button>
+                                                            )}
                                                         </div>
                                                     ) : (
                                                         <select
@@ -811,7 +843,7 @@ export function VoiceSettings() {
                                                                 type="text"
                                                                 value={config.defaultVoice}
                                                                 onChange={(e) => updateConfig(config.id, { defaultVoice: e.target.value })}
-                                                                placeholder={config.provider === "OpenAI" ? "alloy" : "male-qn-qingse 或克隆 Voice ID"}
+                                                                placeholder={config.provider === "OpenAI" ? "alloy" : config.provider === "ElevenLabs" ? "输入 ElevenLabs Voice ID" : "male-qn-qingse 或克隆 Voice ID"}
                                                                 className="flex-1"
                                                             />
                                                             <button
@@ -863,7 +895,7 @@ export function VoiceSettings() {
                                                         className="ui-btn ui-btn ui-btn-soft-action w-full"
                                                     >
                                                         <RefreshCw size={16} className={isFetching[config.id] ? "animate-spin" : ""} />
-                                                        {isFetching[config.id] ? "同步中..." : config.provider === "Minimax" ? "同步音色列表" : "显示默认音色"}
+                                                        {isFetching[config.id] ? "同步中..." : config.provider === "OpenAI" ? "显示默认音色" : "同步音色列表"}
                                                     </button>
                                                     {config.provider === "Minimax" && (
                                                         <button
