@@ -70,14 +70,21 @@ export async function POST(request: Request) {
         if (text.length > MAX_TEXT_LENGTH) return NextResponse.json({ error: "text_too_long", message: `单次朗读最多 ${MAX_TEXT_LENGTH} 个字符` }, { status: 400 });
         if (!/^[A-Za-z0-9_-]{4,128}$/.test(voiceId)) return NextResponse.json({ error: "invalid_voice_id", message: "Voice ID 格式不正确" }, { status: 400 });
 
-        const response = await proxyFetch(`${baseUrl}/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`, {
+        const response = await proxyFetch(`${baseUrl}/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_192`, {
             method: "POST",
             headers: {
                 "xi-api-key": apiKey,
                 "Content-Type": "application/json",
                 Accept: "audio/mpeg",
             },
-            body: JSON.stringify({ text, model_id: model }),
+            body: JSON.stringify({
+    text,
+    model_id: model,
+    voice_settings: {
+        stability: 0.5,
+        similarity_boost: 0.75,
+    },
+}),
             cache: "no-store",
         });
         if (!response.ok) {
