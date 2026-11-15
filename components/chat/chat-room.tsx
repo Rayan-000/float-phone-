@@ -5734,6 +5734,16 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                                                 groupSize={session.isGroup ? (session.participantIds?.length || 0) + (session.isSpectator ? 0 : 1) : undefined}
                                                 onShowDetail={setMediaDetailMsg}
                                                 characterId={msg.senderCharacterId || session.contactId}
+                                                voiceContext={projectedMessages.slice(Math.max(0, idx - 8), idx)
+                                                    .filter(contextMsg => !contextMsg.isRetracted && (contextMsg.role === "user" || contextMsg.role === "assistant"))
+                                                    .map(contextMsg => ({
+                                                        role: contextMsg.role as "user" | "assistant",
+                                                        content: contextMsg.mediaType === "audio"
+                                                            ? (contextMsg.mediaData?.label || "")
+                                                            : (contextMsg.content || ""),
+                                                    }))
+                                                    .filter(contextMsg => contextMsg.content.trim().length > 0)
+                                                    .slice(-8)}
                                                 onUpdate={(updated) => setMessages(prev => prev.map(m => m.id === updated.id ? updated : m))}
                                                 onSystemMessage={(text) => {
                                                     const sysMsg = pushChatMessage({
