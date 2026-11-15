@@ -32,6 +32,27 @@ export function resolveVoiceConfig(characterId: string, appId?: ContentAppId): V
  */
 export type VoiceContextMessage = { role: "user" | "assistant"; content: string };
 
+// Temporary diagnostics for Voice Director. Logs metadata only; never logs
+// chat text, character profile, API keys, or generated speech content.
+const VOICE_DIRECTOR_DEBUG = true;
+const voiceDirectorDiagnosticLines: string[] = [];
+function voiceDirectorLog(event: string, details: Record<string, unknown> = {}): void {
+    if (!VOICE_DIRECTOR_DEBUG) return;
+    console.info("[Voice Director] " + event, details);
+    const detailText = Object.entries(details)
+        .filter(([key]) => key !== "error")
+        .map(([key, value]) => `${key}=${String(value)}`)
+        .join(", ");
+    voiceDirectorDiagnosticLines.push(`${event}${detailText ? ` (${detailText})` : ""}`);
+    if (voiceDirectorDiagnosticLines.length > 30) voiceDirectorDiagnosticLines.shift();
+}
+
+function showVoiceDirectorDiagnostic(): void {
+    if (typeof window === "undefined" || !VOICE_DIRECTOR_DEBUG) return;
+    const report = voiceDirectorDiagnosticLines.splice(0).join("\n");
+    window.alert("Voice Director 诊断结果\n\n" + (report || "没有捕获到诊断记录"));
+}
+
 export async function synthesizeSpeech(
     text: string,
     voiceConfig: VoiceApiConfig,
@@ -66,14 +87,17 @@ async function directVoiceWithContext(
     characterId?: string,
     voiceContext: VoiceContextMessage[] = [],
 ): Promise<string> {
-    if (!characterId || voiceContext.length === 0) return originalText;
+    voiceDirectorLog("分析函数已触发", { hasCharacterId: Boolean(characterId), contextCount: voiceContext.length });
+    if (!characterId) { voiceDirectorLog("跳过分析：缺少 characterId"); return originalText; }
+    if (voiceContext.length === 0) { voiceDirectorLog("跳过分析：voiceContext 为空"); return originalText; }
 
     try {
         const binding = resolveBinding(loadBindingConfig(), characterId, "chat");
-        if (!binding.apiConfigId) return originalText;
+        if (!binding.apiConfigId) { voiceDirectorLog("跳过分析：角色没有绑定聊天 API"); return originalText; }
 
         const apiConfig = loadApiConfigs().find(item => item.id === binding.apiConfigId);
-        if (!apiConfig?.apiKey) return originalText;
+        if (!apiConfig?.apiKey) { voiceDirectorLog("跳过分析：聊天 API 配置不存在或没有 API Key"); return originalText; }
+        voiceDirectorLog("已找到角色聊天 API 配置", { provider: apiConfig.provider || "configured", presetBound: Boolean(binding.presetId) });
 
         const character = loadCharacters().find(item => item.id === characterId);
         const preset = loadPresets().find(item => item.id === binding.presetId) || null;
@@ -81,6 +105,7 @@ async function directVoiceWithContext(
             role: item.role,
             content: item.content.slice(0, 500),
         }));
+        voiceDirectorLog("上下文已整理", { historyCount: history.length, characterProfileAvailable: Boolean(character?.persona || character?.personality) });
 
         const systemPrompt = [
             "You are a voice director for an existing fictional character's text message.",
@@ -116,17 +141,19 @@ async function directVoiceWithContext(
         const timeout = setTimeout(() => controller.abort(), 12000);
         let parsedContent = "";
         try {
+            voiceDirectorLog("正在请求聊天模型进行语音分析");
             const response = await fetchLlmPayload(requestPayload, { signal: controller.signal });
-            if (!response.ok) return originalText;
+            if (!response.ok) { voiceDirectorLog("分析失败：聊天模型 HTTP 错误", { status: response.status }); return originalText; }
             const parsed = parseProviderResponse(requestPayload.providerKind, await response.json());
             parsedContent = parsed.content;
+            voiceDirectorLog("已收到分析结果", { responseLength: parsedContent.length, containsBracketTag: /\[[^\]]+\]/.test(parsedContent) });
         } finally {
             clearTimeout(timeout);
         }
 
         const parsed = { content: parsedContent };
         let candidate = parsed.content.trim().replace(/^["“]|["”]$/g, "").trim();
-        if (!candidate || candidate.length > originalText.length + 120) return originalText;
+        if (!candidate || candidate.length > originalText.length + 120) { voiceDirectorLog("分析结果无效，退回原文", { candidateLength: candidate.length }); return originalText; }
 
         // Only accept compact, known tags. Descriptive bracketed prose is discarded.
         const allowedTags = new Set([
@@ -143,10 +170,13 @@ async function directVoiceWithContext(
         // Reject any model response that changes the actual dialogue.
         const plainText = candidate.replace(/\[[^\]]+\]/g, "").replace(/\s+/g, " ").trim();
         const normalizedOriginal = originalText.replace(/\s+/g, " ").trim();
-        if (plainText !== normalizedOriginal) return originalText;
+        if (plainText !== normalizedOriginal) { voiceDirectorLog("分析结果改动了原台词，安全校验拒绝，退回原文"); return originalText; }
 
+        const tags = Array.from(candidate.matchAll(/\[([^\]]+)\]/g), match => match[1]);
+        voiceDirectorLog("分析完成", { accepted: Boolean(candidate), tagCount: tags.length, tags });
         return candidate || originalText;
-    } catch {
+    } catch (error) {
+        voiceDirectorLog("分析异常，退回原文", { error: error instanceof Error ? error.message : String(error) });
         return originalText;
     }
 }
@@ -281,9 +311,12 @@ async function synthesizeElevenLabs( text: string, config: VoiceApiConfig, optio
 
     // Only v4 supports the concise Audio Tags flow used by this feature.
     const model = (config.model || "eleven_multilingual_v2").trim();
-    const ttsText = model.toLowerCase() === "eleven_v4"
+    const isVoiceDirectorModel = model.toLowerCase() === "eleven_v4";
+    voiceDirectorLog("ElevenLabs 合成开始", { model, voiceDirectorEnabledByModel: isVoiceDirectorModel, contextCount: options?.voiceContext?.length || 0, hasCharacterId: Boolean(options?.characterId) });
+    const ttsText = isVoiceDirectorModel
         ? await directVoiceWithContext(text, options?.characterId, options?.voiceContext || [])
         : text;
+    voiceDirectorLog("准备发送 ElevenLabs", { model, voiceDirectorAddedTags: /\[[^\]]+\]/.test(ttsText), textLength: ttsText.length });
 
     const response = await fetchWithTimeout("/api/voice/elevenlabs", {
         method: "POST",
@@ -299,10 +332,14 @@ async function synthesizeElevenLabs( text: string, config: VoiceApiConfig, optio
 
     if (!response.ok) {
         const errText = await response.text().catch(() => "");
+        voiceDirectorLog("ElevenLabs 合成请求失败", { status: response.status });
         throw new Error(`ElevenLabs TTS 请求失败 (${response.status}): ${errText.slice(0, 500)}`);
     }
 
     const blob = await response.blob();
+    voiceDirectorLog("ElevenLabs 合成成功", { audioBytes: blob.size, contentType: blob.type || "audio/mpeg" });
+    // Phone-friendly temporary diagnostic: show the report without desktop DevTools.
+    showVoiceDirectorDiagnostic();
     return new Blob([await blob.arrayBuffer()], { type: blob.type || "audio/mpeg" });
 }
 
