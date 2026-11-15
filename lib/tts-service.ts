@@ -167,14 +167,67 @@ async function directVoiceWithContext(
             return allowedTags.has(tag) ? `[${tag}]` : "";
         });
 
-        // Reject any model response that changes the actual dialogue.
-        const plainText = candidate.replace(/\[[^\]]+\]/g, "").replace(/\s+/g, " ").trim();
-        const normalizedOriginal = originalText.replace(/\s+/g, " ").trim();
-        if (plainText !== normalizedOriginal) { voiceDirectorLog("分析结果改动了原台词，安全校验拒绝，退回原文"); return originalText; }
+        // Validate spoken characters while ignoring whitespace and punctuation.
+        // Then insert accepted tags into the ORIGINAL text, so the model can
+        // never rewrite the dialogue or alter its punctuation.
+        const getSpeechCharacters = (value: string): string =>
+            Array.from(value).filter(char => !/[\s\p{P}]/u.test(char)).join("");
 
-        const tags = Array.from(candidate.matchAll(/\[([^\]]+)\]/g), match => match[1]);
-        voiceDirectorLog("分析完成", { accepted: Boolean(candidate), tagCount: tags.length, tags });
-        return candidate || originalText;
+        const candidatePlainText = candidate.replace(/\[[^\]]+\]/g, "");
+        const candidateSpeech = getSpeechCharacters(candidatePlainText);
+        const originalSpeech = getSpeechCharacters(originalText);
+
+        if (candidateSpeech !== originalSpeech) {
+            voiceDirectorLog("分析结果改变了台词内容，安全校验拒绝，退回原文");
+            return originalText;
+        }
+
+        const tagMatches = Array.from(candidate.matchAll(/\[([^\]]+)\]/g));
+        const tags = tagMatches.map(match => match[1]);
+        if (tags.length === 0) {
+            voiceDirectorLog("分析完成：没有需要添加的语音标签", { accepted: true, tagCount: 0 });
+            return originalText;
+        }
+
+        // Map each tag's position in the model output onto the original text.
+        // Keep the original wording and punctuation exactly as supplied.
+        const originalChars = Array.from(originalText);
+        const offsets: number[] = [];
+        let utf16Offset = 0;
+        for (const char of originalChars) {
+            offsets.push(utf16Offset);
+            utf16Offset += char.length;
+        }
+        const isSpeechChar = (char: string) => !/[\s\p{P}]/u.test(char);
+        const insertionPoints: Array<{ offset: number; tag: string }> = [];
+
+        for (const match of tagMatches) {
+            const beforeTag = candidate.slice(0, match.index ?? 0).replace(/\[[^\]]+\]/g, "");
+            const speechCount = Array.from(beforeTag).filter(isSpeechChar).length;
+            let seenSpeech = 0;
+            let charIndex = 0;
+            while (charIndex < originalChars.length && seenSpeech < speechCount) {
+                if (isSpeechChar(originalChars[charIndex])) seenSpeech++;
+                charIndex++;
+            }
+            // Place the tag after punctuation/spacing that follows the preceding word.
+            while (charIndex < originalChars.length && !isSpeechChar(originalChars[charIndex])) charIndex++;
+            const offset = charIndex < originalChars.length ? offsets[charIndex] : originalText.length;
+            insertionPoints.push({ offset, tag: match[1] });
+        }
+
+        let taggedOriginal = originalText;
+        insertionPoints.sort((a, b) => b.offset - a.offset);
+        for (const point of insertionPoints) {
+            const left = taggedOriginal.slice(0, point.offset);
+            const right = taggedOriginal.slice(point.offset);
+            const prefix = left && !/\s$/.test(left) ? " " : "";
+            const suffix = right && !/^\s/.test(right) ? " " : "";
+            taggedOriginal = left + prefix + `[${point.tag}]` + suffix + right;
+        }
+
+        voiceDirectorLog("分析完成", { accepted: true, tagCount: tags.length, tags });
+        return taggedOriginal;
     } catch (error) {
         voiceDirectorLog("分析异常，退回原文", { error: error instanceof Error ? error.message : String(error) });
         return originalText;
