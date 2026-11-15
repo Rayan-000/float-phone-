@@ -138,8 +138,14 @@ async function directVoiceWithContext(
         );
 
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 12000);
-        let parsedContent = "";
+const VOICE_DIRECTOR_TIMEOUT_MS = 60_000;
+
+const timeout = setTimeout(() => {
+    voiceDirectorLog("聊天模型语音分析请求超过 60 秒，主动中止");
+    controller.abort();
+}, VOICE_DIRECTOR_TIMEOUT_MS);
+
+let parsedContent = "";
         try {
             voiceDirectorLog("正在请求聊天模型进行语音分析");
             const response = await fetchLlmPayload(requestPayload, { signal: controller.signal });
