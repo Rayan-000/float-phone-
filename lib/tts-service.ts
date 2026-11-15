@@ -1,7 +1,10 @@
 // lib/tts-service.ts — 语音合成服务
 
 import type { VoiceApiConfig, ContentAppId } from "./settings-types";
-import { loadVoiceConfigs, loadBindingConfig, resolveBinding } from "./settings-storage";
+import { loadVoiceConfigs, loadBindingConfig, resolveBinding, loadApiConfigs, loadPresets } from "./settings-storage";
+import { loadCharacters } from "./character-storage";
+import { buildProviderRequest, parseProviderResponse } from "./llm-provider-adapter";
+import { fetchLlmPayload } from "./llm-http";
 
 export type VoiceApiConfigResolved = VoiceApiConfig;
 
@@ -27,10 +30,12 @@ export function resolveVoiceConfig(characterId: string, appId?: ContentAppId): V
  * - OpenAI: REST API → binary audio blob
  * - ElevenLabs: same-origin API route → binary audio blob (avoids browser CORS)
  */
+export type VoiceContextMessage = { role: "user" | "assistant"; content: string };
+
 export async function synthesizeSpeech(
     text: string,
     voiceConfig: VoiceApiConfig,
-    options?: { emotion?: string },
+    options?: { emotion?: string; characterId?: string; voiceContext?: VoiceContextMessage[] },
 ): Promise<Blob | null> {
     if (!text.trim()) return null;
 
@@ -45,10 +50,105 @@ export async function synthesizeSpeech(
     }
 
     if (provider === "ElevenLabs") {
-        return synthesizeElevenLabs(text, voiceConfig);
+        return synthesizeElevenLabs(text, voiceConfig, options);
     }
 
     return null;
+}
+
+/**
+ * Add concise ElevenLabs v4 audio tags using the character's already-bound chat API.
+ * This runs only when the user first requests audio for a message. Any failure
+ * returns the original text so ordinary TTS remains available.
+ */
+async function directVoiceWithContext(
+    originalText: string,
+    characterId?: string,
+    voiceContext: VoiceContextMessage[] = [],
+): Promise<string> {
+    if (!characterId || voiceContext.length === 0) return originalText;
+
+    try {
+        const binding = resolveBinding(loadBindingConfig(), characterId, "chat");
+        if (!binding.apiConfigId) return originalText;
+
+        const apiConfig = loadApiConfigs().find(item => item.id === binding.apiConfigId);
+        if (!apiConfig?.apiKey) return originalText;
+
+        const character = loadCharacters().find(item => item.id === characterId);
+        const preset = loadPresets().find(item => item.id === binding.presetId) || null;
+        const history = voiceContext.slice(-6).map(item => ({
+            role: item.role,
+            content: item.content.slice(0, 500),
+        }));
+
+        const systemPrompt = [
+            "You are a voice director for an existing fictional character's text message.",
+            "Read the recent conversation, the character profile, and the exact line to be spoken.",
+            "Return the exact original line with only a few concise ElevenLabs v4 audio tags inserted where genuinely useful.",
+            "STRICT RULES:",
+            "- Preserve every original spoken word exactly. Do not rewrite, translate, summarize, or add narration.",
+            "- Audio tags must be short keywords only, preferably one word, such as [angry], [sad], [curious], [surprised], [whispers], [sighs], [laughs], [gulps], [hesitates], [sarcastic].",
+            "- Never put a sentence or third-person description inside brackets.",
+            "- Do not add a tag to every sentence. Neutral delivery should have no tag.",
+            "- Use punctuation already present for pauses; do not add explanatory stage directions.",
+            "- Output ONLY the speech-ready line. No quotes, JSON, markdown, or explanation.",
+        ].join("\n");
+
+        const userPrompt = [
+            `CHARACTER NAME: ${character?.name || "Unknown"}`,
+            `CHARACTER PROFILE: ${(character?.persona || character?.personality || "Not provided").slice(0, 2500)}`,
+            `RECENT CONVERSATION:\n${history.map(m => `${m.role === "user" ? "User" : "Character"}: ${m.content}`).join("\n")}`,
+            `EXACT LINE TO SPEAK:\n${originalText}`,
+        ].join("\n\n");
+
+        const requestPayload = buildProviderRequest(
+            apiConfig,
+            preset,
+            [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userPrompt },
+            ],
+            { maxTokens: 120 },
+        );
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 12000);
+        let parsedContent = "";
+        try {
+            const response = await fetchLlmPayload(requestPayload, { signal: controller.signal });
+            if (!response.ok) return originalText;
+            const parsed = parseProviderResponse(requestPayload.providerKind, await response.json());
+            parsedContent = parsed.content;
+        } finally {
+            clearTimeout(timeout);
+        }
+
+        const parsed = { content: parsedContent };
+        let candidate = parsed.content.trim().replace(/^["“]|["”]$/g, "").trim();
+        if (!candidate || candidate.length > originalText.length + 120) return originalText;
+
+        // Only accept compact, known tags. Descriptive bracketed prose is discarded.
+        const allowedTags = new Set([
+            "angry", "sad", "happy", "excited", "curious", "surprised", "whispers",
+            "whispering", "shouts", "shouting", "sighs", "sigh", "laughs", "chuckles", "gulp",
+            "gulps", "hesitates", "sarcastic", "nervous", "calm", "amused", "confused",
+            "frustrated", "playful", "tired", "crying", "softly", "breathless", "mischievously", "clears throat", "pause", "long pause",
+        ]);
+        candidate = candidate.replace(/\[([^\]]+)\]/g, (whole, rawTag: string) => {
+            const tag = rawTag.trim().toLowerCase();
+            return allowedTags.has(tag) ? `[${tag}]` : "";
+        });
+
+        // Reject any model response that changes the actual dialogue.
+        const plainText = candidate.replace(/\[[^\]]+\]/g, "").replace(/\s+/g, " ").trim();
+        const normalizedOriginal = originalText.replace(/\s+/g, " ").trim();
+        if (plainText !== normalizedOriginal) return originalText;
+
+        return candidate || originalText;
+    } catch {
+        return originalText;
+    }
 }
 
 // A stalled TTS request (TCP connected but no response — cold start, rate-limit
@@ -175,9 +275,15 @@ async function synthesizeOpenAI(text: string, config: VoiceApiConfig): Promise<B
 // ── ElevenLabs TTS ───────────────────────────────────
 // Call the app's own Next.js route rather than ElevenLabs directly. This avoids
 // browser CORS restrictions and keeps the API key out of the upstream URL.
-async function synthesizeElevenLabs(text: string, config: VoiceApiConfig): Promise<Blob | null> {
+async function synthesizeElevenLabs( text: string, config: VoiceApiConfig, options?: { characterId?: string; voiceContext?: VoiceContextMessage[] }, ): Promise<Blob | null> {
     if (!config.apiKey) throw new Error("ElevenLabs API Key 未配置");
     if (!config.defaultVoice?.trim()) throw new Error("ElevenLabs Voice ID 未配置");
+
+    // Only v4 supports the concise Audio Tags flow used by this feature.
+    const model = (config.model || "eleven_multilingual_v2").trim();
+    const ttsText = model.toLowerCase() === "eleven_v4"
+        ? await directVoiceWithContext(text, options?.characterId, options?.voiceContext || [])
+        : text;
 
     const response = await fetchWithTimeout("/api/voice/elevenlabs", {
         method: "POST",
@@ -186,8 +292,8 @@ async function synthesizeElevenLabs(text: string, config: VoiceApiConfig): Promi
             apiKey: config.apiKey,
             baseUrl: config.baseUrl || "https://api.elevenlabs.io/v1",
             voiceId: config.defaultVoice.trim(),
-            model: config.model || "eleven_multilingual_v2",
-            text,
+            model,
+            text: ttsText,
         }),
     });
 
